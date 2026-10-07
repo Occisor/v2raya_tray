@@ -207,3 +207,5 @@ Uninstalling the tray icon does not affect v2rayA itself.
 ## Credits
 
 Built for [v2rayA](https://github.com/v2rayA/v2rayA), a web client for an Xray-based core with transparent proxy support. Please follow v2rayA's own terms and local laws when using it.
+
+<a href="https://www.donationalerts.com/r/sociophobenoob"><img src="https://img.shields.io/badge/Donate-DonationAlerts-F57D07" />
