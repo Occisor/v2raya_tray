@@ -27,6 +27,8 @@ v2rayA is a web client: you control it from a browser and it has no tray icon of
 
 If several nodes are connected, the label shows the first one followed by `+N`, and the menu lists all of them. If a group has one member pinned, that member is shown, since all traffic goes through it.
 
+<img src="./v2raya-tray.png" width="30%" alt="example">
+
 ## How it works
 
 Every few seconds the script:
