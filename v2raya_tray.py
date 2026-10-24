@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Tray indicator for v2rayA on Linux / Значок v2rayA в системном трее Linux.
 
-Shows whether the v2rayA core is running and the name of the connected node.
-Data comes from the v2rayA REST API: POST /api/login, GET /api/touch, GET /api/setting.
+Shows whether the v2rayA core is running and the node that is ACTIVE right now.
+Data comes from the v2rayA REST API (POST /api/login, GET /api/touch, GET /api/setting)
+and from its live WebSocket feed (/api/message) with per-node latency.
 Credentials are stored encrypted (standard library only).
 """
 import base64
@@ -12,10 +13,15 @@ import hmac
 import json
 import os
 import secrets
+import socket
+import ssl
+import struct
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +32,7 @@ KEY_PATH = CONFIG_PATH.with_name("key")
 ICON_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP_ID / "icons"
 
 DEFAULTS = {
-    "url": "http://localhost:2017",
+    "url": "http://127.0.0.1:2017",
     "username": "",
     "password": "",
     "language": "en",     # en | ru
@@ -42,6 +48,12 @@ STRINGS = {
         "vpn_off": "VPN off",
         "vpn_paused": "VPN paused",
         "vpn_error": "v2rayA: error",
+        "group_title": "Group “{name}”",
+        "active_unknown": "active node not detected yet (showing the first)",
+        "member_down": "down",
+        "member_pinned": "pinned",
+        "unit_ms": "ms",
+        "more_members": "… and {n} more",
         "mode_ports": "proxy ports only (SOCKS5/HTTP)",
         "mode_transparent": "transparent proxy: {kind}, mode {mode}",
         "err_no_creds": "No credentials set. Run: v2raya-tray --setup",
@@ -70,6 +82,12 @@ STRINGS = {
         "vpn_off": "VPN выключен",
         "vpn_paused": "VPN на паузе",
         "vpn_error": "v2rayA: ошибка",
+        "group_title": "Группа «{name}»",
+        "active_unknown": "активный узел пока не определён (показан первый)",
+        "member_down": "недоступен",
+        "member_pinned": "закреплён",
+        "unit_ms": "мс",
+        "more_members": "… и ещё {n}",
         "mode_ports": "только прокси-порты (SOCKS5/HTTP)",
         "mode_transparent": "прозрачный прокси: {kind}, режим {mode}",
         "err_no_creds": "Логин и пароль не заданы. Выполните: v2raya-tray --setup",
@@ -277,21 +295,86 @@ class ApiError(Exception):
     pass
 
 
+DEFAULT_GROUP = "proxy"   # the main outbound group of v2rayA
+MAX_MEMBERS = 10          # menu lines per group
+
+
+@dataclass
+class Member:
+    name: str
+    alive: object = None   # True / False, or None when there is no observation
+    delay: object = None   # milliseconds, or None
+    active: bool = False
+
+
+@dataclass
+class Group:
+    name: str
+    members: list
+    pinned: bool = False        # one member is pinned: the group routes through it alone
+    active_known: bool = True   # False: could not tell which member is in use
+
+    @property
+    def active(self):
+        return next((m for m in self.members if m.active), None)
+
+
 @dataclass
 class Status:
     state: str                      # on | off | paused | error
-    servers: list = field(default_factory=list)
+    groups: list = field(default_factory=list)
     mode: str = ""
     detail: str = ""
 
     @property
+    def main(self):
+        return self.groups[0] if self.groups else None
+
+    @property
     def label(self):
         if self.state == "on":
-            if not self.servers:
+            g = self.main
+            if g is None or not g.members:
                 return tr("vpn_active")
-            extra = f" +{len(self.servers) - 1}" if len(self.servers) > 1 else ""
-            return tr("vpn_server", name=self.servers[0], extra=extra)
+            if g.active:
+                return tr("vpn_server", name=g.active.name, extra="")
+            extra = f" +{len(g.members) - 1}" if len(g.members) > 1 else ""
+            return tr("vpn_server", name=g.members[0].name, extra=extra)
         return tr({"off": "vpn_off", "paused": "vpn_paused", "error": "vpn_error"}[self.state])
+
+
+def member_text(m, group, with_delay=True):
+    text = ("● " if m.active else "    ") + m.name
+    tags = []
+    if m.active and group.pinned:
+        tags.append(tr("member_pinned"))
+    if m.alive is False:
+        tags.append(tr("member_down"))
+    elif with_delay and m.delay is not None and m.alive:
+        tags.append(f"{m.delay} {tr('unit_ms')}")
+    return text + (" — " + ", ".join(tags) if tags else "")
+
+
+def menu_lines(st, with_delay=True):
+    """Text lines of the menu header block. Without delays they only change when something structural does."""
+    lines = [st.label]
+    if st.state == "error":
+        lines.append(st.detail)
+        return lines
+    if st.state == "off":
+        return lines
+    for g in st.groups:
+        if len(st.groups) > 1 or g.name != DEFAULT_GROUP:
+            lines.append(tr("group_title", name=g.name))
+        if not g.active_known:
+            lines.append(tr("active_unknown"))
+        ordered = sorted(g.members, key=lambda m: not m.active)  # the active one goes first
+        lines.extend(member_text(m, g, with_delay) for m in ordered[:MAX_MEMBERS])
+        if len(ordered) > MAX_MEMBERS:
+            lines.append(tr("more_members", n=len(ordered) - MAX_MEMBERS))
+    if st.mode:
+        lines.append(st.mode)
+    return lines
 
 
 class V2rayAClient:
@@ -302,6 +385,7 @@ class V2rayAClient:
         self.timeout = timeout
         self.cred_error = cred_error
         self.token = None
+        self._lock = threading.RLock()  # the poller and the WebSocket thread share the token
 
     def _request(self, method, path, body=None):
         headers = {"Content-Type": "application/json"}
@@ -340,31 +424,41 @@ class V2rayAClient:
             raise ApiError(tr("err_login", msg=p.get("message") or tr("err_wrong_pass")))
         self.token = p["data"]["token"]
 
-    def _get(self, path):
-        for _ in range(2):
+    def ensure_token(self):
+        with self._lock:
             if not self.token:
                 self._login()
+            return self.token
+
+    def invalidate_token(self, token=None):
+        with self._lock:
+            if token is None or self.token == token:
+                self.token = None
+
+    def _get(self, path):
+        for _ in range(2):
+            self.ensure_token()
             status, p = self._request("GET", path)
             # an expired token arrives either as HTTP 401 or as 200 + errorCode
             if status == 401 or p.get("errorCode") in ("SESSION_EXPIRED", "SESSION_INVALID"):
                 if self._is_first_run(p):
                     raise ApiError(tr("err_first_run"))
-                self.token = None
+                self.invalidate_token()
                 continue
             if p.get("code") != "SUCCESS":
                 raise ApiError(str(p.get("message") or tr("err_api")))
             return p["data"]
         raise ApiError(tr("err_auth"))
 
-    def fetch(self):
-        """Always returns a Status, never raises."""
+    def fetch(self, observed=None):
+        """Always returns a Status, never raises. `observed(outbound)` gives live latency data or None."""
         try:
             touch = self._get("/api/touch")
             try:
                 setting = self._get("/api/setting").get("setting") or {}
             except ApiError:
                 setting = {}  # the mode is an optional detail
-            return parse_status(touch, setting)
+            return parse_status(touch, setting, observed)
         except ApiError as e:
             return Status("error", detail=str(e))
         except OSError as e:  # URLError, timeout, connection refused
@@ -372,26 +466,80 @@ class V2rayAClient:
             return Status("error", detail=tr("err_unreachable", url=self.base, reason=reason))
 
 
-def connected_server_names(touch):
-    """Names of connected nodes. `sub` in connectedServer is 0-based, `id` is 1-based."""
+# ---------------------------------------------------------------- which node is active
+def node_key(w):
+    """Identity of a node inside a touch / observatory entry. `sub` only counts for subscription nodes."""
+    kind = w.get("_type")
+    return (kind, w.get("sub", 0) if kind == "subscriptionServer" else 0, w.get("id"))
+
+
+def _node_name(touch, w):
+    """`sub` in connectedServer is 0-based, `id` is 1-based."""
     servers = touch.get("servers") or []
     subs = touch.get("subscriptions") or []
-    selected, others = [], []
+    idx = (w.get("id") or 0) - 1
+    if idx < 0:
+        return None
+    try:
+        if w.get("_type") == "server":
+            return servers[idx]["name"] or None
+        if w.get("_type") == "subscriptionServer":
+            return subs[w["sub"]]["servers"][idx]["name"] or None
+    except (IndexError, KeyError, TypeError):
+        pass
+    return None
+
+
+def build_groups(touch, observed=None):
+    """Connected nodes grouped by outbound, the main group ("proxy") first, with the ACTIVE member marked.
+
+    Active member of a group:
+      1. the pinned one (`selected`): the group routes through it alone;
+      2. the only member;
+      3. otherwise v2rayA balances with `leastping`: the alive member with the lowest delay,
+         taken from the live observatory feed. Without fresh data it is unknown.
+    """
+    raw = {}   # outbound -> {"names", "keys", "pinned"}
+    order = []
     for w in touch.get("connectedServer") or []:
-        idx = w.get("id", 0) - 1
-        name = None
-        try:
-            if w.get("_type") == "server":
-                name = servers[idx]["name"]
-            elif w.get("_type") == "subscriptionServer":
-                name = subs[w["sub"]]["servers"][idx]["name"]
-        except (IndexError, KeyError, TypeError):
-            pass
-        if idx < 0 or not name:
+        name = _node_name(touch, w)
+        if not name:
             continue
-        (selected if w.get("selected") else others).append(name)
-    # if the group pins one member, traffic goes only through it
-    return selected or others
+        ob = w.get("outbound") or DEFAULT_GROUP
+        if ob not in raw:
+            raw[ob] = {"names": [], "keys": [], "pinned": None}
+            order.append(ob)
+        g = raw[ob]
+        if w.get("selected") and g["pinned"] is None:
+            g["pinned"] = len(g["names"])
+        g["names"].append(name)
+        g["keys"].append(node_key(w))
+    if DEFAULT_GROUP in order:
+        order.remove(DEFAULT_GROUP)
+        order.insert(0, DEFAULT_GROUP)
+
+    groups = []
+    for ob in order:
+        g = raw[ob]
+        members = [Member(n) for n in g["names"]]
+        snap = observed(ob) if observed else None
+        if snap:
+            for m, key in zip(members, g["keys"]):
+                if key in snap:
+                    m.alive, m.delay = snap[key]
+        known = True
+        if g["pinned"] is not None:
+            members[g["pinned"]].active = True
+        elif len(members) == 1:
+            members[0].active = True
+        else:
+            alive = [m for m in members if m.alive]
+            if alive:
+                min(alive, key=lambda m: m.delay if m.delay is not None else float("inf")).active = True
+            else:
+                known = False
+        groups.append(Group(ob, members, pinned=g["pinned"] is not None, active_known=known))
+    return groups
 
 
 def describe_mode(setting):
@@ -401,15 +549,222 @@ def describe_mode(setting):
     return tr("mode_transparent", kind=setting.get("transparentType") or "?", mode=mode)
 
 
-def parse_status(touch_data, setting):
+def parse_status(touch_data, setting, observed=None):
     if touch_data.get("networkPaused"):
         state = "paused"
     elif touch_data.get("running"):
         state = "on"
     else:
         state = "off"
-    names = connected_server_names(touch_data.get("touch") or {}) if state != "off" else []
-    return Status(state, servers=names, mode=describe_mode(setting) if state != "off" else "")
+    if state == "off":
+        return Status(state)
+    groups = build_groups(touch_data.get("touch") or {}, observed)
+    return Status(state, groups=groups, mode=describe_mode(setting))
+
+
+# ---------------------------------------------------------------- live feed (minimal WebSocket client)
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_MAX_FRAME = 8 * 1024 * 1024
+
+
+class WsError(Exception):
+    pass
+
+
+class WsHandshakeError(WsError):
+    def __init__(self, status):
+        super().__init__(f"handshake failed: HTTP {status}")
+        self.status = status
+
+
+def ws_connect(base_url, path, token, timeout=10):
+    """Open a WebSocket (RFC 6455) to base_url + path. Returns (socket, bytes read past the handshake)."""
+    u = urllib.parse.urlsplit(base_url)
+    secure = u.scheme == "https"
+    port = u.port or (443 if secure else 80)
+    sock = socket.create_connection((u.hostname, port), timeout=timeout)
+    try:
+        if secure:
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+        key = base64.b64encode(os.urandom(16)).decode()
+        host = u.hostname if not u.port else f"{u.hostname}:{u.port}"
+        quoted = urllib.parse.quote(token, safe="")
+        target = f"{u.path.rstrip('/')}{path}?token={quoted}&Authorization={quoted}"
+        sock.sendall((f"GET {target} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                      f"Sec-WebSocket-Version: 13\r\nAuthorization: {token}\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise WsError("connection closed during handshake")
+            buf += chunk
+            if len(buf) > 65536:
+                raise WsError("handshake response too large")
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        try:
+            status = int(lines[0].split()[1])
+        except (IndexError, ValueError):
+            raise WsError("bad handshake response")
+        if status != 101:
+            raise WsHandshakeError(status)
+        headers = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        if headers.get("sec-websocket-accept") != accept:
+            raise WsError("bad Sec-WebSocket-Accept")
+        return sock, rest
+    except BaseException:
+        sock.close()
+        raise
+
+
+class WsReader:
+    """Reads complete text messages; answers pings; a client must mask what it sends."""
+
+    def __init__(self, sock, initial=b""):
+        self.sock = sock
+        self.buf = bytearray(initial)
+        self.last_rx = time.monotonic()
+
+    def _read(self, n, at_boundary=False):
+        deadline = time.monotonic() + 30
+        while len(self.buf) < n:
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                if at_boundary and not self.buf:
+                    raise  # idle between frames: let the caller decide
+                if time.monotonic() > deadline:
+                    raise WsError("stalled in the middle of a frame")
+                continue
+            if not chunk:
+                raise WsError("connection closed")
+            self.buf += chunk
+            self.last_rx = time.monotonic()
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def send(self, opcode, payload=b""):
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + masked)  # control frames: <= 125 bytes
+
+    def recv_text(self):
+        parts, started = [], False
+        while True:
+            b1, b2 = self._read(2, at_boundary=True)
+            fin, rsv, opcode = b1 & 0x80, b1 & 0x70, b1 & 0x0F
+            if rsv:
+                raise WsError("compressed frames are not supported")
+            length = b2 & 0x7F
+            if length == 126:
+                (length,) = struct.unpack(">H", self._read(2))
+            elif length == 127:
+                (length,) = struct.unpack(">Q", self._read(8))
+            if length > WS_MAX_FRAME:
+                raise WsError("frame too large")
+            mask = self._read(4) if b2 & 0x80 else None
+            payload = self._read(length) if length else b""
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:
+                raise WsError("closed by server")
+            if opcode == 0x9:
+                self.send(0xA, payload[:125])
+            elif opcode == 0xA:
+                pass
+            elif opcode in (0x1, 0x0):
+                if opcode == 0x1:
+                    parts, started = [], True
+                if not started:
+                    raise WsError("unexpected continuation frame")
+                parts.append(payload)
+                if fin:
+                    return b"".join(parts).decode("utf-8")
+
+
+class ObservatoryFeed:
+    """Background thread that keeps the latest per-node latency published by v2rayA.
+
+    `snapshot(outbound)` returns {node_key: (alive, delay_ms)} or None when there is no fresh data.
+    """
+    STALE_AFTER = 20  # seconds; v2rayA publishes about once a second while the core runs
+
+    def __init__(self, client):
+        self.client = client
+        self._lock = threading.Lock()
+        self._data = {}
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="observatory-feed", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def snapshot(self, outbound):
+        with self._lock:
+            entry = self._data.get(outbound)
+        if entry is None or time.monotonic() - entry[0] > self.STALE_AFTER:
+            return None
+        return entry[1]
+
+    def handle(self, text):
+        try:
+            msg = json.loads(text)
+            if msg.get("type") != "observatory":
+                return False
+            body = msg["body"]
+            statuses = {}
+            for st in body.get("outboundStatus") or []:
+                which = st.get("which")
+                if isinstance(which, dict):
+                    statuses[node_key(which)] = (bool(st.get("alive")), st.get("delay"))
+            with self._lock:
+                self._data[body["outboundName"]] = (time.monotonic(), statuses)
+            return True
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return False  # a malformed message must never kill the feed
+
+    def _session(self):
+        token = self.client.ensure_token()
+        try:
+            sock, rest = ws_connect(self.client.base, "/api/message", token)
+        except WsHandshakeError as e:
+            if e.status == 401:
+                self.client.invalidate_token(token)
+            raise
+        got_data = False
+        try:
+            sock.settimeout(15)
+            reader = WsReader(sock, rest)
+            while not self._stop.is_set():
+                try:
+                    text = reader.recv_text()
+                except socket.timeout:
+                    if time.monotonic() - reader.last_rx > 45:
+                        raise WsError("no data from the server")
+                    reader.send(0x9)  # keep-alive ping
+                    continue
+                got_data = self.handle(text) or got_data
+        finally:
+            sock.close()
+        return got_data
+
+    def _run(self):
+        backoff = 2
+        while not self._stop.is_set():
+            try:
+                if self._session():
+                    backoff = 2
+            except (WsError, ApiError, OSError, ValueError):
+                pass
+            self._stop.wait(backoff)
+            backoff = min(backoff * 2, 30)
 
 
 # ---------------------------------------------------------------- tray UI
@@ -439,12 +794,14 @@ def run_tray(cfg):
 
     write_icons()
     client = make_client(cfg)
+    feed = ObservatoryFeed(client)
+    feed.start()
 
     ind = AppIndicator.Indicator.new(APP_ID, f"{APP_ID}-off", AppIndicator.IndicatorCategory.APPLICATION_STATUS)
     ind.set_icon_theme_path(str(ICON_DIR))
     ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
 
-    state = {"busy": False, "last": None}
+    state = {"busy": False, "last": None, "sig": None, "items": []}
 
     def add_line(menu, text, sensitive=False):
         item = Gtk.MenuItem(label=text)
@@ -454,38 +811,42 @@ def run_tray(cfg):
 
     def build_menu(st):
         menu = Gtk.Menu()
-        add_line(menu, st.label)
-        if st.state == "error":
-            add_line(menu, st.detail)
-        elif st.state != "off":
-            for name in st.servers:
-                add_line(menu, f"  • {name}")
-            if st.mode:
-                add_line(menu, st.mode)
+        state["items"] = [add_line(menu, text) for text in menu_lines(st)]
         menu.append(Gtk.SeparatorMenuItem())
         open_ui = add_line(menu, tr("menu_open"), True)
         open_ui.connect("activate", lambda *_: subprocess.Popen(["xdg-open", cfg["url"]]))
         refresh = add_line(menu, tr("menu_refresh"), True)
         refresh.connect("activate", lambda *_: tick())
         quit_item = add_line(menu, tr("menu_quit"), True)
-        quit_item.connect("activate", lambda *_: Gtk.main_quit())
+        quit_item.connect("activate", lambda *_: (feed.stop(), Gtk.main_quit()))
         menu.show_all()
         return menu
 
     def apply(st):
         state["busy"] = False
-        if st != state["last"]:  # rebuild the menu only on changes
-            state["last"] = st
-            ind.set_icon_full(f"{APP_ID}-{st.state}", st.label)
-            ind.set_title(st.label)
-            if cfg["show_label"]:
-                text = st.label if len(st.label) <= 32 else st.label[:31] + "…"
-                ind.set_label(text, "v2rayA: " + "x" * 24)
-            ind.set_menu(build_menu(st))
+        if st == state["last"]:
+            return False
+        state["last"] = st
+        # signature without latencies: when only the numbers moved, relabel the items in place
+        # instead of rebuilding, which would close a menu the user has open
+        sig = (st.state, tuple(menu_lines(st, with_delay=False)))
+        if sig == state["sig"]:
+            for item, text in zip(state["items"], menu_lines(st)):
+                item.set_label(text)
+            return False
+        state["sig"] = sig
+        # The menu goes first: libayatana-appindicator creates its D-Bus object path only once a menu
+        # exists, and set_title() emits a signal on that path (a GLib-GIO-CRITICAL warning otherwise).
+        ind.set_menu(build_menu(st))
+        ind.set_icon_full(f"{APP_ID}-{st.state}", st.label)
+        ind.set_title(st.label)
+        if cfg["show_label"]:
+            text = st.label if len(st.label) <= 32 else st.label[:31] + "…"
+            ind.set_label(text, "v2rayA: " + "x" * 24)
         return False
 
     def worker():
-        GLib.idle_add(apply, client.fetch())
+        GLib.idle_add(apply, client.fetch(feed.snapshot))
 
     def tick():
         if not state["busy"]:
@@ -498,14 +859,27 @@ def run_tray(cfg):
     Gtk.main()
 
 
+def run_once(cfg):
+    """Diagnostics without a GUI: print the status; wait briefly for live data if the active node is unknown."""
+    client = make_client(cfg)
+    feed = ObservatoryFeed(client)
+    feed.start()
+    st = client.fetch(feed.snapshot)
+    deadline = time.monotonic() + 4
+    while st.state == "on" and any(not g.active_known for g in st.groups) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        st = client.fetch(feed.snapshot)
+    feed.stop()
+    print("\n".join(menu_lines(st)))
+
+
 def main():
     if "--setup" in sys.argv:
         run_setup()
         return
     cfg = load_config()
-    if "--once" in sys.argv:  # diagnostics without a GUI
-        st = make_client(cfg).fetch()
-        print(st.label, "|", st.mode or st.detail)
+    if "--once" in sys.argv:
+        run_once(cfg)
         return
     try:
         run_tray(cfg)
